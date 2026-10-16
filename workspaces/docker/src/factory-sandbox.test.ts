@@ -1,6 +1,3 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { describeFactorySandbox, isFactorySandbox } from '@mastra/core/workspace';
 import type { FactorySandboxContext } from '@mastra/core/workspace';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -10,6 +7,14 @@ import { DockerSandbox } from './sandbox';
 import * as repoTemplate from './template/repo-template';
 import { createDockerRepoTemplate } from './template/repo-template';
 import type { DockerTemplate, DockerTemplateBuildResult } from './template/template';
+
+const execFileAsync = vi.hoisted(() => vi.fn());
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
+  execFileAsync.mockImplementation(promisify(actual.execFile));
+  return { ...actual, execFile: Object.assign(vi.fn(actual.execFile), { [promisify.custom]: execFileAsync }) };
+});
 
 const cloneUrl = 'https://example.com/acme/app.git';
 const sha = '0123456789abcdef0123456789abcdef01234567';
@@ -26,18 +31,15 @@ function context(): FactorySandboxContext {
 }
 
 describe('DockerFactorySandbox', () => {
-  // Clone URLs must be https, so `git ls-remote` is stubbed on PATH.
-  let dir: string;
-  let prevPath: string | undefined;
   beforeAll(() => {
-    dir = mkdtempSync(join(tmpdir(), 'docker-factory-sandbox-'));
-    writeFileSync(join(dir, 'git'), `#!/bin/sh\nprintf '${sha}\\tHEAD\\n'\n`, { mode: 0o755 });
-    prevPath = process.env.PATH;
-    process.env.PATH = `${dir}:${prevPath}`;
+    execFileAsync.mockImplementation(async (file: string, args: readonly string[]) => {
+      expect(file).toBe('git');
+      expect(args?.slice(0, 2)).toEqual(['ls-remote', '--']);
+      return { stdout: `${sha}\tHEAD\n`, stderr: '' };
+    });
   });
   afterAll(() => {
-    process.env.PATH = prevPath;
-    rmSync(dir, { recursive: true, force: true });
+    execFileAsync.mockReset();
   });
 
   it('is a branded FactorySandbox with template-affecting image and owner settings and local builds', () => {

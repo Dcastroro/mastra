@@ -5,7 +5,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -17,6 +17,14 @@ import {
 } from '@internal/workspace';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { buildMultiRepoTemplate, buildRepoTemplate, createDockerRepoTemplate, resolveHead } from './repo-template';
+
+const execFileAsync = vi.hoisted(() => vi.fn());
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  const { promisify } = await import('node:util');
+  execFileAsync.mockImplementation(promisify(actual.execFile));
+  return { ...actual, execFile: Object.assign(vi.fn(actual.execFile), { [promisify.custom]: execFileAsync }) };
+});
 
 const cloneUrl = 'https://example.com/acme/app.git';
 const sha = '0123456789abcdef0123456789abcdef01234567';
@@ -357,109 +365,125 @@ describe('createDockerRepoTemplate', () => {
     });
 
     it('passes the token to ls-remote through GIT_CONFIG_* env, never argv', async () => {
-      const binDir = join(dir, 'bin');
-      mkdirSync(binDir, { recursive: true });
-      const log = join(dir, 'git.log');
-      writeFileSync(
-        join(binDir, 'git'),
-        `#!/bin/sh\nprintf 'ARGV=%s\\n' "$*" >> '${log}'\nprintf 'CFG=%s\\n' "$GIT_CONFIG_VALUE_0" >> '${log}'\nprintf '${headSha}\\tHEAD\\n'\n`,
-        { mode: 0o755 },
-      );
-      const prevPath = process.env.PATH;
-      process.env.PATH = `${binDir}:${prevPath}`;
-      try {
-        await expect(resolveHead('https://example.com/a/b.git', undefined, 'tok-secret')).resolves.toBe(headSha);
-      } finally {
-        process.env.PATH = prevPath;
-      }
-      const recorded = readFileSync(log, 'utf8');
+      execFileAsync.mockResolvedValueOnce({ stdout: `${headSha}\tHEAD\n`, stderr: '' });
+      await expect(resolveHead('https://example.com/a/b.git', undefined, 'tok-secret')).resolves.toBe(headSha);
+
+      const [file, args, options] = execFileAsync.mock.calls.at(-1)!;
       const expectedHeader = `AUTHORIZATION: basic ${Buffer.from('x-access-token:tok-secret').toString('base64')}`;
-      expect(recorded).toContain(`CFG=${expectedHeader}`);
-      expect(recorded).toMatch(/ARGV=ls-remote -- https:\/\/example\.com\/a\/b\.git HEAD/);
-      expect(recorded).not.toContain('ARGV=-c');
-      expect(recorded).not.toContain('tok-secret');
+      expect(file).toBe('git');
+      expect(args).toEqual(['ls-remote', '--', 'https://example.com/a/b.git', 'HEAD']);
+      expect(options?.shell).not.toBe(true);
+      expect(options?.timeout).toBe(10_000);
+      expect(options?.env).toMatchObject({
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'http.extraheader',
+        GIT_CONFIG_VALUE_0: expectedHeader,
+        GIT_TERMINAL_PROMPT: '0',
+      });
+      expect(JSON.stringify(args)).not.toContain('tok-secret');
+      expect(JSON.stringify(args)).not.toContain(expectedHeader);
     });
 
-    // Clone URLs must be https, so the resolver-level tests stub `git` on PATH
-    // instead of touching the network.
-    const withFakeGit = async (script: string, run: () => Promise<void>) => {
-      const binDir = mkdtempSync(join(dir, 'fake-git-'));
-      writeFileSync(join(binDir, 'git'), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
-      const prevPath = process.env.PATH;
-      process.env.PATH = `${binDir}:${prevPath}`;
+    // HTTPS clone resolution is mocked; local bare-repository tests above use real git.
+    const withFakeGit = async (respond: (args: readonly string[]) => string, run: () => Promise<void>) => {
+      const original = execFileAsync.getMockImplementation()!;
+      execFileAsync.mockImplementation(async (file: string, args: readonly string[]) => {
+        expect(file).toBe('git');
+        expect(args.slice(0, 2)).toEqual(['ls-remote', '--']);
+        return { stdout: respond(args), stderr: '' };
+      });
       try {
         await run();
       } finally {
-        process.env.PATH = prevPath;
+        execFileAsync.mockImplementation(original);
       }
     };
 
     it('rejects when the head cannot be resolved rather than caching an unpinned clone', async () => {
-      await withFakeGit('exit 128', async () => {
-        const resolver = createDockerRepoTemplate({ getRepositoryAccess: async () => ({ cloneUrl }) })!;
-        await expect(resolver()).rejects.toThrow(/Could not resolve HEAD of https:\/\/example\.com/);
-      });
+      await withFakeGit(
+        () => {
+          throw new Error('git failed');
+        },
+        async () => {
+          const resolver = createDockerRepoTemplate({ getRepositoryAccess: async () => ({ cloneUrl }) })!;
+          await expect(resolver()).rejects.toThrow(/Could not resolve HEAD of https:\/\/example\.com/);
+        },
+      );
     });
 
     it('resolves each list entry by its own ref, numbers secrets by position, and rejects a duplicate dir', async () => {
-      const script = `case "$*" in *v1*) printf '${sha}\\tv1\\n';; *) printf '${headSha}\\tHEAD\\n';; esac`;
-      await withFakeGit(script, async () => {
-        const resolver = createDockerRepoTemplate({
-          repos: [
-            {
-              getRepositoryAccess: async () => ({
-                cloneUrl: 'https://example.com/acme/private.git',
-                authorization: { token: 'tok-1' },
-              }),
-              ref: 'v1',
-            },
-            { getRepositoryAccess: async () => ({ cloneUrl }) },
-          ],
-          continueOnSetupFailure: true,
-        })!;
-        const template = await resolver();
-        expect(template.dockerfile).toContain(`git -C '/workspace/private' checkout --detach '${sha}'`);
-        expect(template.dockerfile).toContain(`git -C '/workspace/app' checkout --detach '${headSha}'`);
-        expect(template.dockerfile).toContain('id=GH_TOKEN_0');
-        expect(template.dockerfile.indexOf("clone 'https://example.com/acme/app.git'")).toBeLessThan(
-          template.dockerfile.indexOf("clone 'https://example.com/acme/private.git'"),
-        );
-        expect(template.dockerfile).not.toContain('tok-1');
+      await withFakeGit(
+        args => (args.includes('v1') ? `${sha}\tv1\n` : `${headSha}\tHEAD\n`),
+        async () => {
+          const resolver = createDockerRepoTemplate({
+            repos: [
+              {
+                getRepositoryAccess: async () => ({
+                  cloneUrl: 'https://example.com/acme/private.git',
+                  authorization: { token: 'tok-1' },
+                }),
+                ref: 'v1',
+              },
+              { getRepositoryAccess: async () => ({ cloneUrl }) },
+            ],
+            continueOnSetupFailure: true,
+          })!;
+          const template = await resolver();
+          expect(template.dockerfile).toContain(`git -C '/workspace/private' checkout --detach '${sha}'`);
+          expect(template.dockerfile).toContain(`git -C '/workspace/app' checkout --detach '${headSha}'`);
+          expect(template.dockerfile).toContain('id=GH_TOKEN_0');
+          expect(template.dockerfile.indexOf("clone 'https://example.com/acme/app.git'")).toBeLessThan(
+            template.dockerfile.indexOf("clone 'https://example.com/acme/private.git'"),
+          );
+          expect(template.dockerfile).not.toContain('tok-1');
 
-        const getRepositoryAccess = async () => ({ cloneUrl });
-        await expect(
-          createDockerRepoTemplate({ repos: [{ getRepositoryAccess }, { getRepositoryAccess }] })!(),
-        ).rejects.toThrow(/both clone into/);
-      });
+          const getRepositoryAccess = async () => ({ cloneUrl });
+          await expect(
+            createDockerRepoTemplate({ repos: [{ getRepositoryAccess }, { getRepositoryAccess }] })!(),
+          ).rejects.toThrow(/both clone into/);
+        },
+      );
     });
 
     it('rejects the whole list when one head cannot be resolved', async () => {
-      await withFakeGit(`case "$*" in *private*) exit 128;; *) printf '${headSha}\\tHEAD\\n';; esac`, async () => {
-        const resolver = createDockerRepoTemplate({
-          repos: [
-            { getRepositoryAccess: async () => ({ cloneUrl }) },
-            { getRepositoryAccess: async () => ({ cloneUrl: 'https://example.com/acme/private.git' }) },
-          ],
-        })!;
-        await expect(resolver()).rejects.toThrow(/Could not resolve HEAD of https:\/\/example\.com\/acme\/private/);
-      });
+      await withFakeGit(
+        args => {
+          if (args.some(arg => arg.includes('private'))) throw new Error('git failed');
+          return `${headSha}\tHEAD\n`;
+        },
+        async () => {
+          const resolver = createDockerRepoTemplate({
+            repos: [
+              { getRepositoryAccess: async () => ({ cloneUrl }) },
+              { getRepositoryAccess: async () => ({ cloneUrl: 'https://example.com/acme/private.git' }) },
+            ],
+          })!;
+          await expect(resolver()).rejects.toThrow(/Could not resolve HEAD of https:\/\/example\.com\/acme\/private/);
+        },
+      );
     });
 
     it('pins the current head sha into the template so a moved branch rebuilds', async () => {
       const getRepositoryAccess = async () => ({ cloneUrl });
       const moved = 'f'.repeat(40);
-      await withFakeGit(`printf '${headSha}\\tHEAD\\n'`, async () => {
-        const before = await createDockerRepoTemplate({ getRepositoryAccess })!();
-        expect(before.dockerfile).toContain(`checkout --detach '${headSha}'`);
-        // A full sha ref skips ls-remote entirely and is pinned verbatim.
-        const pinned = await createDockerRepoTemplate({ getRepositoryAccess, ref: sha })!();
-        expect(pinned.dockerfile).toContain(`checkout --detach '${sha}'`);
-        expect(pinned.templateId).not.toBe(before.templateId);
-      });
-      await withFakeGit(`printf '${moved}\\tHEAD\\n'`, async () => {
-        const after = await createDockerRepoTemplate({ getRepositoryAccess })!();
-        expect(after.dockerfile).toContain(`checkout --detach '${moved}'`);
-      });
+      await withFakeGit(
+        () => `${headSha}\tHEAD\n`,
+        async () => {
+          const before = await createDockerRepoTemplate({ getRepositoryAccess })!();
+          expect(before.dockerfile).toContain(`checkout --detach '${headSha}'`);
+          // A full sha ref skips ls-remote entirely and is pinned verbatim.
+          const pinned = await createDockerRepoTemplate({ getRepositoryAccess, ref: sha })!();
+          expect(pinned.dockerfile).toContain(`checkout --detach '${sha}'`);
+          expect(pinned.templateId).not.toBe(before.templateId);
+        },
+      );
+      await withFakeGit(
+        () => `${moved}\tHEAD\n`,
+        async () => {
+          const after = await createDockerRepoTemplate({ getRepositoryAccess })!();
+          expect(after.dockerfile).toContain(`checkout --detach '${moved}'`);
+        },
+      );
     });
   });
 });
